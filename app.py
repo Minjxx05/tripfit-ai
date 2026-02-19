@@ -1,6 +1,5 @@
-import os
 import json
-import base64
+import urllib.parse
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,49 +9,47 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
+# ========= Models =========
+TEXT_MODEL = "gemini-2.5-flash"
+IMAGE_MODEL = "gemini-2.5-flash-image"  # Nano Banana 계열(네이티브 이미지 생성)
 
-# =========================
-# Config
-# =========================
-TEXT_MODEL = "gemini-2.5-flash"          # 텍스트 생성용
-IMAGE_MODEL = "gemini-2.5-flash-image"  # Nano Banana(이미지 생성) :contentReference[oaicite:4]{index=4}
-
-APP_TITLE = "Tripfit ✈️👗"
-APP_DESC = "목적지/날씨/스타일에 맞춘 코디 추천 + 가상 캐리어 패킹 + 무드보드 생성"
+# ========= Shop URLs =========
+MUSINSA_SEARCH_BASE = "https://store.musinsa.com/app/product/search?search_type=1&q="
+ABLY_SEARCH_BASE = "https://m.a-bly.com/search?keyword="
 
 
-# =========================
-# Utilities
-# =========================
+# ========= Helpers =========
+def _safe_json_loads(text: str) -> Dict[str, Any]:
+    t = (text or "").strip()
+    if t.startswith("```"):
+        parts = t.split("```")
+        if len(parts) >= 3:
+            t = parts[1]
+    t = t.strip()
+    i, j = t.find("{"), t.rfind("}")
+    if i != -1 and j != -1 and j > i:
+        t = t[i : j + 1]
+    return json.loads(t)
+
+
 def get_api_key() -> Optional[str]:
-    # 1) Streamlit secrets
+    # 1) 화면 입력(세션)
+    key = st.session_state.get("api_key_input")
+    if key and key.strip():
+        return key.strip()
+
+    # 2) Streamlit secrets (선택)
     if "GEMINI_API_KEY" in st.secrets:
         return st.secrets["GEMINI_API_KEY"]
-    # 2) env var
-    return os.getenv("GEMINI_API_KEY")
+
+    return None
 
 
 def gemini_client() -> genai.Client:
     key = get_api_key()
     if not key:
-        raise RuntimeError("GEMINI_API_KEY가 없습니다. Streamlit secrets 또는 환경변수로 설정해주세요.")
-    return genai.Client(api_key=key)  # Google Gen AI SDK :contentReference[oaicite:5]{index=5}
-
-
-def safe_json_loads(s: str) -> Dict[str, Any]:
-    """
-    모델이 가끔 ```json ... ``` 형태로 감싸서 주는 경우가 있어 방어적으로 파싱합니다.
-    """
-    s = s.strip()
-    if s.startswith("```"):
-        s = s.split("```", 2)[1] if s.count("```") >= 2 else s.strip("```")
-    s = s.strip()
-    # 혹시 앞뒤에 잡텍스트가 붙으면 가장 큰 JSON 덩어리만 추출 시도
-    first = s.find("{")
-    last = s.rfind("}")
-    if first != -1 and last != -1:
-        s = s[first:last + 1]
-    return json.loads(s)
+        raise RuntimeError("Gemini API Key가 필요합니다.")
+    return genai.Client(api_key=key)
 
 
 def call_gemini_text(prompt: str, temperature: float = 0.7) -> str:
@@ -60,42 +57,26 @@ def call_gemini_text(prompt: str, temperature: float = 0.7) -> str:
     resp = client.models.generate_content(
         model=TEXT_MODEL,
         contents=[prompt],
-        config=types.GenerateContentConfig(
-            temperature=temperature,
-        ),
+        config=types.GenerateContentConfig(temperature=temperature),
     )
-    # google-genai 응답은 parts로 오기도 하고 text로 합쳐지기도 합니다.
     if getattr(resp, "text", None):
         return resp.text
-    parts = []
-    for p in getattr(resp, "parts", []) or []:
-        if getattr(p, "text", None):
-            parts.append(p.text)
-    return "\n".join(parts).strip()
+    return ""
 
 
-def call_gemini_structured(prompt: str, retries: int = 2) -> Dict[str, Any]:
-    """
-    JSON만 반환하도록 강하게 지시하고 파싱. 실패 시 재시도.
-    """
-    json_instruction = """
-반드시 유효한 JSON만 출력하세요. 다른 텍스트/설명/마크다운/코드펜스 금지.
-"""
-    last_err = None
+def call_gemini_json(prompt: str, retries: int = 2) -> Dict[str, Any]:
+    rule = "반드시 유효한 JSON만 출력. 다른 텍스트/설명/마크다운/코드펜스 금지."
+    last = None
     for _ in range(retries + 1):
         try:
-            text = call_gemini_text(json_instruction + "\n" + prompt, temperature=0.4)
-            return safe_json_loads(text)
+            txt = call_gemini_text(rule + "\n" + prompt, temperature=0.4)
+            return _safe_json_loads(txt)
         except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"JSON 파싱 실패: {last_err}")
+            last = e
+    raise RuntimeError(f"Gemini JSON 파싱 실패: {last}")
 
 
-def open_meteo_geocode(city: str) -> Optional[Tuple[float, float, str, str]]:
-    """
-    Open-Meteo Geocoding (무료)
-    """
+def geocode_city(city: str) -> Optional[Tuple[float, float, str, str]]:
     url = "https://geocoding-api.open-meteo.com/v1/search"
     r = requests.get(url, params={"name": city, "count": 1, "language": "ko", "format": "json"}, timeout=20)
     r.raise_for_status()
@@ -104,22 +85,15 @@ def open_meteo_geocode(city: str) -> Optional[Tuple[float, float, str, str]]:
     if not results:
         return None
     it = results[0]
-    lat = it["latitude"]
-    lon = it["longitude"]
-    name = it.get("name", city)
-    country = it.get("country", "")
-    return lat, lon, name, country
+    return float(it["latitude"]), float(it["longitude"]), it.get("name", city), it.get("country", "")
 
 
-def open_meteo_forecast(lat: float, lon: float, start: date, end: date) -> Dict[str, Any]:
-    """
-    Open-Meteo forecast (무료)
-    """
+def forecast_daily(lat: float, lon: float, start: date, end: date) -> Dict[str, Any]:
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
         "longitude": lon,
-        "daily": "weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max,windspeed_10m_max",
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max,windspeed_10m_max",
         "timezone": "auto",
         "start_date": start.isoformat(),
         "end_date": end.isoformat(),
@@ -129,78 +103,56 @@ def open_meteo_forecast(lat: float, lon: float, start: date, end: date) -> Dict[
     return r.json()
 
 
-def summarize_weather(forecast: Dict[str, Any]) -> str:
-    daily = forecast.get("daily", {})
-    dates = daily.get("time", [])
-    tmax = daily.get("temperature_2m_max", [])
-    tmin = daily.get("temperature_2m_min", [])
-    pop = daily.get("precipitation_probability_max", [])
-    wind = daily.get("windspeed_10m_max", [])
+def summarize_weather(f: Dict[str, Any]) -> str:
+    d = f.get("daily", {}) or {}
+    times = d.get("time", []) or []
+    tmax = d.get("temperature_2m_max", []) or []
+    tmin = d.get("temperature_2m_min", []) or []
+    pop = d.get("precipitation_probability_max", []) or []
+    wind = d.get("windspeed_10m_max", []) or []
 
-    if not dates:
-        return "날씨 정보를 가져오지 못했습니다."
+    if not times:
+        return "날씨 정보를 가져오지 못했어요."
 
     lines = []
-    for i in range(len(dates)):
+    for i in range(len(times)):
         lines.append(
-            f"- {dates[i]}: 최저 {tmin[i]}°C / 최고 {tmax[i]}°C, 강수확률 {pop[i]}%, 최대풍속 {wind[i]} km/h"
+            f"{times[i]} · {tmin[i]}~{tmax[i]}°C · ☔ {pop[i]}% · 💨 {wind[i]}km/h"
         )
     return "\n".join(lines)
 
 
-def extract_items_from_outfits(outfits: List[Dict[str, Any]]) -> List[str]:
-    items = []
-    for o in outfits:
-        for k in ["tops", "bottoms", "outerwear", "shoes", "accessories", "bags"]:
-            for it in o.get(k, []) or []:
-                if isinstance(it, str):
-                    items.append(it.strip())
-    # 중복 제거(순서 유지)
-    seen = set()
-    uniq = []
-    for x in items:
-        if x and x not in seen:
-            seen.add(x)
-            uniq.append(x)
-    return uniq
+def make_musinsa_search_url(query: str) -> str:
+    return MUSINSA_SEARCH_BASE + urllib.parse.quote(query)
 
 
-def generate_moodboard_images(
-    city: str,
-    season: str,
-    style: str,
-    vibe: str,
-    n: int = 4,
-) -> List[Image.Image]:
-    """
-    Nano Banana(Gemini native image model)로 무드보드 이미지 생성
-    """
+def make_ably_search_url(query: str) -> str:
+    return ABLY_SEARCH_BASE + urllib.parse.quote(query)
+
+
+def normalize_query(brand: str, name: str, extra: str = "") -> str:
+    q = " ".join([x for x in [brand, name, extra] if x and x.strip()])
+    return " ".join(q.split()).strip()
+
+
+def generate_moodboard_images(city: str, season: str, style: str, vibe: str, n: int = 4) -> List[Image.Image]:
     client = gemini_client()
-
-    # 여러 장을 한 번에 뽑기보단, 4개 프롬프트를 각각 생성(실패 격리)
     prompts = [
-        f"Create a photorealistic street-style fashion photo in {city} during {season}. Style: {style}. Vibe: {vibe}. Full body, natural light, influencer look, high detail, no text.",
-        f"Create a photorealistic outfit flat-lay on a clean background. Destination: {city}, season: {season}. Style: {style}. Include 6-8 items (top, bottom, outerwear, shoes, bag, accessories). No text.",
-        f"Create a photorealistic candid travel photo in {city} during {season}. Style: {style}. Vibe: {vibe}. Subject wearing a travel-appropriate outfit, realistic, no text.",
-        f"Create a photorealistic fashion editorial shot inspired by {city} in {season}. Style: {style}. Vibe: {vibe}. Clean composition, no text.",
+        f"Photorealistic street-style fashion photo in {city} during {season}. Style: {style}. Vibe: {vibe}. Full body, natural light, no text.",
+        f"Photorealistic outfit flat-lay on clean background. Destination: {city}, season: {season}. Style: {style}. Include 6-8 items. No text.",
+        f"Photorealistic candid travel photo in {city} during {season}. Style: {style}. Vibe: {vibe}. Subject wearing travel outfit. No text.",
+        f"Photorealistic fashion editorial inspired by {city} in {season}. Style: {style}. Vibe: {vibe}. Clean composition. No text.",
     ][:n]
 
-    images: List[Image.Image] = []
+    imgs: List[Image.Image] = []
     for p in prompts:
         resp = client.models.generate_content(
             model=IMAGE_MODEL,
             contents=[p],
-            # 일부 SDK 예시처럼 config를 생략해도 생성되지만,
-            # 안정성을 위해 "TEXT/IMAGE" 둘 다 허용
-            config=types.GenerateContentConfig(
-                response_modalities=["TEXT", "IMAGE"]
-            ),
+            config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
         )
 
-        # parts에서 inline image 찾기
-        got = False
         parts = []
-        # SDK 버전에 따라 candidates 구조가 있을 수 있어 방어적으로 접근
         if hasattr(resp, "parts") and resp.parts:
             parts = resp.parts
         elif hasattr(resp, "candidates") and resp.candidates:
@@ -208,271 +160,345 @@ def generate_moodboard_images(
 
         for part in parts:
             if getattr(part, "inline_data", None) is not None:
-                img = part.as_image()
-                images.append(img)
-                got = True
+                imgs.append(part.as_image())
                 break
-        if not got:
-            # 이미지가 안 왔으면 스킵(앱은 계속 진행)
-            continue
 
-    return images
+    return imgs
 
 
-# =========================
-# Streamlit UI
-# =========================
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title(APP_TITLE)
-st.caption(APP_DESC)
+# ========= UI =========
+st.set_page_config(page_title="Tripfit", layout="wide")
 
-with st.expander("✅ PRD 기반 구현 범위(3대 기능)", expanded=False):
-    st.markdown(
-        """
-- (1) **AI 맞춤 코디 제안**: 목적지/날씨/스타일 입력 → 3가지 코디 + 이유 생성  
-- (2) **가상 캐리어 패킹**: 코디 아이템을 체크리스트로 관리  
-- (3) **여행지 무드보드**: Nano Banana(이미지 모델)로 도시/계절/스타일 무드 이미지 생성
-"""
-    )
-
-# Sidebar inputs
-st.sidebar.header("여행 정보 입력")
-destination = st.sidebar.text_input("목적지(도시명)", value="Paris")
-col_d1, col_d2 = st.sidebar.columns(2)
-start_date = col_d1.date_input("여행 시작일", value=date.today() + timedelta(days=7))
-end_date = col_d2.date_input("여행 종료일", value=date.today() + timedelta(days=10))
-
-gender = st.sidebar.selectbox("성별", ["여성", "남성", "기타/선택안함"])
-style = st.sidebar.selectbox("스타일 취향", ["미니멀", "빈티지", "스트릿", "클래식", "러블리", "시티보이/시티걸", "고프코어", "기타"])
-age_band = st.sidebar.selectbox("연령대", ["10대", "20대", "30대", "40대", "50대+"])
-activities = st.sidebar.multiselect(
-    "주요 일정(TPO)",
-    ["박물관/미술관", "맛집/카페", "자연/트레킹", "야경/바", "쇼핑", "비즈니스/세미나", "테마파크"],
-    default=["맛집/카페", "박물관/미술관"],
+st.markdown(
+    """
+<style>
+:root { --card: rgba(255,255,255,0.75); }
+.block-container { padding-top: 1.2rem; }
+.big-title { font-size: 2.0rem; font-weight: 800; letter-spacing: -0.02em; }
+.subtle { color: rgba(0,0,0,0.55); }
+.card {
+  background: var(--card);
+  border: 1px solid rgba(0,0,0,0.08);
+  border-radius: 18px;
+  padding: 16px 16px;
+}
+.chip {
+  display: inline-block;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(0,0,0,0.06);
+  margin-right: 6px;
+  margin-bottom: 6px;
+  font-size: 0.85rem;
+}
+.hr {
+  height: 1px;
+  background: rgba(0,0,0,0.08);
+  margin: 12px 0;
+}
+</style>
+""",
+    unsafe_allow_html=True,
 )
-budget = st.sidebar.selectbox("예산 감도", ["가성비", "중간", "프리미엄"])
-season_hint = st.sidebar.text_input("계절/체감(선택)", value="")
 
-st.sidebar.divider()
-st.sidebar.subheader("Gemini API 키 상태")
-key_ok = bool(get_api_key())
-st.sidebar.write("✅ 설정됨" if key_ok else "❌ 미설정")
-st.sidebar.caption("Streamlit Cloud에서는 Secrets에 GEMINI_API_KEY를 등록하세요.")
+st.markdown('<div class="big-title">Tripfit ✈️👗</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtle">여행지 분위기 + 날씨 + 취향 → 코디 & 쇼핑 & 패킹 & 무드보드</div>', unsafe_allow_html=True)
 
-# Main
-tab1, tab2, tab3 = st.tabs(["1) 코디 추천", "2) 캐리어 패킹", "3) 무드보드 (Nano Banana)"])
+# session init
+st.session_state.setdefault("outfits", [])
+st.session_state.setdefault("packing_list", [])
+st.session_state.setdefault("packed_set", set())
+st.session_state.setdefault("weather_text", "")
+st.session_state.setdefault("confirmed_products", [])  # [{outfit, category, url, note}]
 
-# Session state
-if "outfits" not in st.session_state:
-    st.session_state.outfits = []
-if "weather_text" not in st.session_state:
-    st.session_state.weather_text = ""
-if "packing" not in st.session_state:
-    st.session_state.packing = []  # list[str]
-if "packed" not in st.session_state:
-    st.session_state.packed = set()
+# Sidebar
+with st.sidebar:
+    st.markdown("### 🔑 Gemini API Key")
+    st.text_input(
+        "키를 여기 붙여넣기",
+        type="password",
+        key="api_key_input",
+        placeholder="AI Studio에서 발급한 Gemini API Key",
+        help="이 키는 브라우저 세션에만 저장됩니다(새로고침/재접속 시 사라짐).",
+    )
+    has_key = bool(get_api_key())
+    st.caption("✅ 연결됨" if has_key else "키를 넣어야 실행돼요.")
 
+    st.markdown("---")
+    st.markdown("### 🌍 여행 설정")
+    destination = st.text_input("도시", value="Tokyo")
+    c1, c2 = st.columns(2)
+    start_date = c1.date_input("시작", value=date.today() + timedelta(days=7))
+    end_date = c2.date_input("종료", value=date.today() + timedelta(days=10))
 
+    st.markdown("### ✨ 취향")
+    style = st.selectbox("스타일", ["미니멀", "빈티지", "스트릿", "클래식", "러블리", "시티보이/시티걸", "고프코어", "기타"])
+    vibe = st.text_input("무드 키워드", value="clean, chic, city walk, travel street style")
+    season_hint = st.text_input("계절/체감(선택)", value="")
+    activities = st.multiselect("일정", ["박물관/미술관", "맛집/카페", "자연/트레킹", "야경/바", "쇼핑", "비즈니스/세미나", "테마파크"], default=["맛집/카페"])
+    budget = st.selectbox("예산", ["가성비", "중간", "프리미엄"])
+
+# Main tabs
+tab1, tab2, tab3 = st.tabs(["👗 코디 & 쇼핑", "🧳 패킹", "🍌 무드보드"])
+
+# ---------- TAB 1 ----------
 with tab1:
-    st.subheader("AI 맞춤 코디 제안")
-    st.write("목적지 좌표/날씨를 불러온 뒤, Gemini가 3가지 코디를 JSON으로 생성합니다.")
+    left, right = st.columns([1.2, 1])
+    with left:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("#### 오늘의 여행 룩 만들기")
+        st.markdown('<div class="subtle">날씨부터 읽고, 코디를 감성적으로 뽑아줄게요.</div>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    run_btn = st.button("🧠 코디 생성하기", type="primary", use_container_width=True)
+    with right:
+        go = st.button("✨ 코디 생성", type="primary", use_container_width=True)
 
-    if run_btn:
-        if not key_ok:
-            st.error("GEMINI_API_KEY가 필요합니다. Streamlit Secrets 또는 환경변수로 설정해주세요.")
-        else:
-            if end_date < start_date:
-                st.error("종료일은 시작일보다 같거나 이후여야 합니다.")
-            else:
-                with st.spinner("도시 검색 및 날씨 불러오는 중..."):
-                    geo = open_meteo_geocode(destination)
-                    if not geo:
-                        st.error("도시를 찾지 못했어요. 영문 도시명으로 다시 시도해보세요.")
-                        st.stop()
-                    lat, lon, city_name, country = geo
+    if go:
+        if not has_key:
+            st.error("Gemini API Key를 먼저 입력해줘.")
+            st.stop()
+        if end_date < start_date:
+            st.error("종료일은 시작일 이후여야 해.")
+            st.stop()
 
-                    # Open-Meteo는 최대 기간 제한이 있을 수 있어, 14일 이상은 요약만
-                    # (필요하면 여기에서 기간을 잘라서 호출)
-                    forecast = open_meteo_forecast(lat, lon, start_date, end_date)
-                    weather_text = summarize_weather(forecast)
-                    st.session_state.weather_text = weather_text
+        with st.spinner("날씨 불러오는 중…"):
+            geo = geocode_city(destination)
+            if not geo:
+                st.error("도시를 찾지 못했어. 영문 도시명으로도 시도해줘.")
+                st.stop()
+            lat, lon, city_name, country = geo
+            f = forecast_daily(lat, lon, start_date, end_date)
+            weather = summarize_weather(f)
+            st.session_state.weather_text = weather
 
-                st.markdown("### 🌦️ 여행 기간 날씨(요약)")
-                st.markdown(weather_text)
+        season_line = season_hint.strip() if season_hint.strip() else "날씨 기반"
+        tpo = ", ".join(activities) if activities else "일반 여행"
 
-                with st.spinner("Gemini가 코디를 추천 중..."):
-                    tpo = ", ".join(activities) if activities else "일반 여행"
-                    season_line = season_hint.strip() if season_hint.strip() else "알 수 없음(날씨 기반 판단)"
-                    prompt = f"""
-너는 여행 코디 스타일리스트야. 아래 정보를 바탕으로 3가지 코디를 추천해줘.
-반드시 아래 JSON 스키마를 지켜.
+        with st.spinner("룩을 고르는 중…"):
+            prompt = f"""
+너는 여행 스타일리스트이자 쇼핑 큐레이터야.
 
-[입력]
-- 목적지: {city_name}, {country}
+[여행]
+- 도시: {city_name}, {country}
 - 기간: {start_date.isoformat()} ~ {end_date.isoformat()}
-- 여행자: {age_band}, 성별 {gender}
-- 스타일 취향: {style}
-- 일정(TPO): {tpo}
-- 예산 감도: {budget}
-- 계절/체감 힌트: {season_line}
-- 날씨 상세:
-{weather_text}
+- 스타일: {style}
+- 무드: {vibe}
+- 일정: {tpo}
+- 예산: {budget}
+- 계절 힌트: {season_line}
+- 날씨:
+{st.session_state.weather_text}
 
 [출력 JSON 스키마]
 {{
   "outfits": [
     {{
-      "title": "코디 이름(짧게)",
-      "scenario": "언제/어디에 입는지(TPO)",
-      "tops": ["..."],
-      "bottoms": ["..."],
-      "outerwear": ["..."],
-      "shoes": ["..."],
-      "bags": ["..."],
-      "accessories": ["..."],
-      "why": "날씨/스타일/활동 관점의 추천 이유(2~4문장)",
-      "layering_tip": "레이어링/온도 대응 팁(1~2문장)"
+      "title": "코디 이름(감성적으로)",
+      "mood_tags": ["태그", "태그"],
+      "scenario": "언제 입는지(짧게)",
+      "why": "이 룩이 좋은 이유(2~3문장)",
+      "layering_tip": "온도/비/바람 대응 팁(1~2문장)",
+      "items": [
+        {{
+          "category": "상의/하의/아우터/신발/가방/액세서리",
+          "must_have": true,
+          "notes": "핏/소재/색/스타일 포인트",
+          "product_candidates": [
+            {{
+              "platform": "MUSINSA|ABLY",
+              "brand": "브랜드",
+              "product_name": "상품명(검색에 걸리게 구체적으로)",
+              "keywords": "검색 보조(색/핏/소재)",
+              "price_tier": "가성비|중간|프리미엄"
+            }}
+          ]
+        }}
+      ]
     }}
   ],
-  "general_tips": ["여행 코디 팁 3개"]
+  "packing_list": ["짐 리스트(중복 제거)"]
 }}
 
 [규칙]
-- 브랜드명/가격 언급 금지.
-- 너무 추상적인 단어 대신 실제 의류 품목으로 작성(예: '코트' OK, '예쁜 옷' NO).
-- 날씨가 춥거나 비/바람이 있으면 대응 아이템(방풍/우산/방수 신발 등)을 포함.
+- 반드시 JSON만 출력.
+- 브랜드 언급 허용.
+- URL은 만들지 말고, 검색에 잘 걸리도록 상품명/키워드를 구체화.
 """
-                    data = call_gemini_structured(prompt)
-                    outfits = data.get("outfits", [])
-                    st.session_state.outfits = outfits
+            data = call_gemini_json(prompt)
+            st.session_state.outfits = data.get("outfits", []) or []
+            st.session_state.packing_list = data.get("packing_list", []) or []
+            st.session_state.confirmed_products = []
 
-                    # 패킹 리스트도 동기화
-                    items = extract_items_from_outfits(outfits)
-                    st.session_state.packing = items
+    # Weather card
+    if st.session_state.weather_text:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("#### 🌦️ 날씨")
+        st.markdown(st.session_state.weather_text)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-                st.success("코디 생성 완료!")
-
+    # Outfit cards
     if st.session_state.outfits:
-        st.markdown("### 👗 추천 코디 3가지")
-        for i, o in enumerate(st.session_state.outfits, start=1):
-            with st.container(border=True):
-                st.markdown(f"#### {i}. {o.get('title','(제목 없음)')}")
-                st.caption(o.get("scenario", ""))
+        st.markdown("### 룩 카드")
+        for oi, outfit in enumerate(st.session_state.outfits, start=1):
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown(f"### {oi}. {outfit.get('title','')}")
+            tags = outfit.get("mood_tags", []) or []
+            if tags:
+                st.markdown("".join([f'<span class="chip">{t}</span>' for t in tags]), unsafe_allow_html=True)
 
-                cols = st.columns(3)
-                cols[0].markdown("**상의**\n" + "\n".join([f"- {x}" for x in (o.get("tops") or [])]))
-                cols[0].markdown("**아우터**\n" + "\n".join([f"- {x}" for x in (o.get('outerwear') or [])]))
+            st.markdown(f"**{outfit.get('scenario','')}**")
+            st.markdown(f"{outfit.get('why','')}")
+            st.caption(outfit.get("layering_tip", ""))
 
-                cols[1].markdown("**하의**\n" + "\n".join([f"- {x}" for x in (o.get("bottoms") or [])]))
-                cols[1].markdown("**신발**\n" + "\n".join([f"- {x}" for x in (o.get('shoes') or [])]))
+            st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
-                cols[2].markdown("**가방**\n" + "\n".join([f"- {x}" for x in (o.get("bags") or [])]))
-                cols[2].markdown("**액세서리**\n" + "\n".join([f"- {x}" for x in (o.get('accessories') or [])]))
+            for it in (outfit.get("items", []) or []):
+                cat = it.get("category", "")
+                must = it.get("must_have", False)
+                notes = it.get("notes", "")
 
-                st.markdown("**추천 이유**")
-                st.write(o.get("why", ""))
-                st.markdown("**레이어링/날씨 대응 팁**")
-                st.write(o.get("layering_tip", ""))
+                st.markdown(f"**{cat}** {' · 꼭' if must else ''}")
+                if notes:
+                    st.caption(notes)
 
-        st.markdown("### ✅ 일반 팁")
-        # general_tips가 없으면 표시 생략
-        # (여기서는 call_gemini_structured에서 함께 받도록 했지만, 방어적으로)
-        # tips는 마지막 실행의 data를 들고 있지 않으니, 간단히 텍스트 모델로 즉석 생성
-        if st.button("여행 코디 팁 다시 생성"):
-            t = call_gemini_text(
-                f"{destination} 여행(스타일:{style}) 코디 일반 팁 3가지만 불릿으로 짧게 써줘.",
-                temperature=0.6,
-            )
-            st.write(t)
+                cands = it.get("product_candidates", []) or []
+                for ci, c in enumerate(cands):
+                    platform = (c.get("platform") or "").strip().upper()
+                    brand = (c.get("brand") or "").strip()
+                    pname = (c.get("product_name") or "").strip()
+                    kw = (c.get("keywords") or "").strip()
+                    tier = (c.get("price_tier") or "").strip()
+
+                    q = normalize_query(brand, pname, kw)
+                    if not q:
+                        continue
+
+                    colA, colB, colC = st.columns([5, 2, 2])
+
+                    with colA:
+                        st.markdown(f"- **{brand}** · {pname}  \n  <span class='subtle'>{kw} · {tier}</span>",
+                                    unsafe_allow_html=True)
+
+                    with colB:
+                        if platform == "ABLY":
+                            st.link_button("에이블리 검색", make_ably_search_url(q), use_container_width=True)
+                        else:
+                            st.link_button("무신사 검색", make_musinsa_search_url(q), use_container_width=True)
+
+                    with colC:
+                        with st.popover("🔖 상품 확정"):
+                            st.caption("검색에서 마음에 드는 ‘상품 상세 URL’을 붙여넣어 저장.")
+                            url = st.text_input(
+                                "상품 URL",
+                                key=f"url_{oi}_{cat}_{ci}",
+                                placeholder="https:// ...",
+                            )
+                            note = st.text_input(
+                                "메모(선택)",
+                                key=f"note_{oi}_{cat}_{ci}",
+                                placeholder="예: 블랙 M, 롱기장",
+                            )
+                            if st.button("저장", key=f"save_{oi}_{cat}_{ci}", use_container_width=True):
+                                if url and url.strip().startswith("http"):
+                                    st.session_state.confirmed_products.append(
+                                        {
+                                            "outfit": outfit.get("title", ""),
+                                            "category": cat,
+                                            "brand": brand,
+                                            "product_name": pname,
+                                            "url": url.strip(),
+                                            "note": note.strip(),
+                                        }
+                                    )
+                                    st.success("저장됨")
+                                else:
+                                    st.error("URL이 유효하지 않아.")
+
+            st.markdown("</div>", unsafe_allow_html=True)
+            st.write("")
+
+        if st.session_state.confirmed_products:
+            st.markdown("### 🔖 저장한 상품")
+            for p in st.session_state.confirmed_products:
+                label = f"{p['outfit']} · {p['category']} · {p['brand']} · {p['product_name']}"
+                if p.get("note"):
+                    label += f"  ({p['note']})"
+                st.link_button(label, p["url"], use_container_width=True)
 
 
+# ---------- TAB 2 ----------
 with tab2:
-    st.subheader("가상 캐리어 패킹(체크리스트)")
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("### 🧳 패킹 체크")
+    st.markdown('<div class="subtle">룩에서 뽑힌 아이템으로 시작해, 너만의 리스트로 다듬어봐.</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    if not st.session_state.packing:
-        st.info("먼저 1) 코디 추천을 생성하면 아이템이 자동으로 들어옵니다.")
+    if not st.session_state.packing_list:
+        st.info("먼저 ‘코디 생성’을 해줘.")
     else:
-        st.write("추천 코디에서 추출한 아이템을 체크하면서 짐을 꾸릴 수 있어요.")
+        add = st.text_input("추가할 아이템", placeholder="예: 접이식 우산, 보조배터리, 히트텍")
+        if st.button("추가", use_container_width=True):
+            if add.strip() and add.strip() not in st.session_state.packing_list:
+                st.session_state.packing_list.append(add.strip())
 
-        # 추가 아이템 입력
-        add_item = st.text_input("추가할 아이템(선택)", placeholder="예: 히트텍, 접이식 우산")
-        if st.button("➕ 추가", use_container_width=True):
-            if add_item.strip():
-                if add_item.strip() not in st.session_state.packing:
-                    st.session_state.packing.append(add_item.strip())
+        st.write("")
+        packed = set(st.session_state.packed_set)
+        for item in st.session_state.packing_list:
+            v = st.checkbox(item, value=(item in packed), key=f"pack_{item}")
+            if v:
+                packed.add(item)
+            else:
+                packed.discard(item)
+        st.session_state.packed_set = packed
+
+        total = len(st.session_state.packing_list)
+        done = len(st.session_state.packed_set)
+        st.metric("진행", f"{done}/{total}")
+
+        if st.button("부족한 것만 감성 체크", use_container_width=True):
+            if not has_key:
+                st.error("Gemini API Key를 입력해줘.")
+            else:
+                missing = [x for x in st.session_state.packing_list if x not in st.session_state.packed_set]
+                if not missing:
+                    st.success("완벽해. 그대로 떠나도 돼.")
                 else:
-                    st.warning("이미 목록에 있어요.")
-
-        st.divider()
-
-        # 체크리스트 표시
-        packed_now = set(st.session_state.packed)
-        for item in st.session_state.packing:
-            checked = item in packed_now
-            new_val = st.checkbox(item, value=checked, key=f"pack_{item}")
-            if new_val:
-                packed_now.add(item)
-            else:
-                packed_now.discard(item)
-
-        st.session_state.packed = packed_now
-
-        st.divider()
-        total = len(st.session_state.packing)
-        done = len(st.session_state.packed)
-        st.metric("패킹 진행률", f"{done}/{total}")
-
-        # 간단 “구매/보완 제안” (실제 쇼핑몰 연동 대신 텍스트 추천)
-        if st.button("🛍️ 부족 아이템 보완 제안 받기", type="secondary", use_container_width=True):
-            missing = [x for x in st.session_state.packing if x not in st.session_state.packed]
-            if not missing:
-                st.success("이미 다 챙겼어요! 👍")
-            else:
-                prompt = f"""
-너는 여행 짐 패킹 컨설턴트야.
+                    prompt = f"""
+너는 여행 패킹 컨설턴트야.
 목적지: {destination}
 스타일: {style}
 날씨:
 {st.session_state.weather_text}
 
-아직 안 챙긴 목록:
+미완료:
 {missing}
 
-1) 누락되면 여행에서 불편할 수 있는 상위 5개를 골라 중요도 순으로 설명
-2) 대체 가능한 아이템/간단한 구매 기준(브랜드/가격 언급 금지)
-불릿으로 간단히.
+- 우선순위 TOP 5만
+- 각 항목: 왜 필요한지(짧게) + 대체 아이템(있다면)
+- 말투는 담백하고 감성 있게, 불릿으로.
 """
-                st.write(call_gemini_text(prompt, temperature=0.5))
+                    st.markdown(call_gemini_text(prompt, temperature=0.5))
 
 
+# ---------- TAB 3 ----------
 with tab3:
-    st.subheader("여행지 무드보드 (Nano Banana 이미지 생성)")
-    st.write("도시/계절/스타일 무드를 반영한 이미지 4장을 생성합니다. (텍스트+이미지 멀티모달)")
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("### 🍌 무드보드")
+    st.markdown('<div class="subtle">도시의 공기 + 오늘의 취향을 이미지로.</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    vibe = st.text_input("무드 키워드(선택)", value="clean, chic, travel street style")
     season_for_image = st.text_input("계절(이미지용)", value=season_hint if season_hint.strip() else "current season")
 
-    gen_mb = st.button("🍌 무드보드 만들기", type="primary", use_container_width=True)
-    if gen_mb:
-        if not key_ok:
-            st.error("GEMINI_API_KEY가 필요합니다. Streamlit Secrets 또는 환경변수로 설정해주세요.")
+    if st.button("무드보드 생성", type="primary", use_container_width=True):
+        if not has_key:
+            st.error("Gemini API Key를 입력해줘.")
         else:
-            with st.spinner("Nano Banana로 무드보드 생성 중..."):
-                imgs = generate_moodboard_images(
-                    city=destination,
-                    season=season_for_image,
-                    style=style,
-                    vibe=vibe,
-                    n=4,
-                )
+            with st.spinner("이미지 생성 중…"):
+                imgs = generate_moodboard_images(destination, season_for_image, style, vibe, n=4)
+
             if not imgs:
-                st.warning("이미지 생성에 실패했어요. 잠시 후 다시 시도하거나 프롬프트를 바꿔보세요.")
+                st.warning("이번엔 잘 안 나왔어. 키워드를 조금 바꿔줘.")
             else:
                 cols = st.columns(4)
                 for i, im in enumerate(imgs):
                     cols[i % 4].image(im, use_container_width=True)
-
-    st.caption("참고: Nano Banana는 Gemini의 네이티브 이미지 생성 기능(예: gemini-2.5-flash-image)입니다. :contentReference[oaicite:6]{index=6}")
-
