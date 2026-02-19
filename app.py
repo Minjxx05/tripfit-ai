@@ -5,14 +5,23 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 import streamlit as st
 from PIL import Image
+
 from google import genai
 from google.genai import types
+from google.genai import errors as genai_errors
 
-# ========= Models =========
-TEXT_MODEL = "gemini-2.5-flash"
-IMAGE_MODEL = "gemini-2.5-flash-image"  # Nano Banana 계열(네이티브 이미지 생성)
 
-# ========= Helpers =========
+# ========= Defaults =========
+DEFAULT_TEXT_MODEL = "gemini-2.5-flash"
+DEFAULT_IMAGE_MODEL = "gemini-2.5-flash-image"  # Nano Banana (official doc example) :contentReference[oaicite:1]{index=1}
+
+IMAGE_MODEL_OPTIONS = [
+    "gemini-2.5-flash-image",
+    "gemini-3-pro-image-preview",  # Android docs mention this image model preview :contentReference[oaicite:2]{index=2}
+]
+
+
+# ========= JSON helper =========
 def _safe_json_loads(text: str) -> Dict[str, Any]:
     t = (text or "").strip()
     if t.startswith("```"):
@@ -26,16 +35,13 @@ def _safe_json_loads(text: str) -> Dict[str, Any]:
     return json.loads(t)
 
 
+# ========= Key / client =========
 def get_api_key() -> Optional[str]:
-    # 화면 입력(세션에만 저장됨)
     key = st.session_state.get("api_key_input")
     if key and key.strip():
         return key.strip()
-
-    # (선택) secrets 지원
     if "GEMINI_API_KEY" in st.secrets:
         return st.secrets["GEMINI_API_KEY"]
-
     return None
 
 
@@ -46,22 +52,22 @@ def gemini_client() -> genai.Client:
     return genai.Client(api_key=key)
 
 
-def call_gemini_text(prompt: str, temperature: float = 0.7) -> str:
+def call_gemini_text(prompt: str, model: str, temperature: float = 0.7) -> str:
     client = gemini_client()
     resp = client.models.generate_content(
-        model=TEXT_MODEL,
+        model=model,
         contents=[prompt],
         config=types.GenerateContentConfig(temperature=temperature),
     )
     return getattr(resp, "text", "") or ""
 
 
-def call_gemini_json(prompt: str, retries: int = 2) -> Dict[str, Any]:
+def call_gemini_json(prompt: str, model: str, retries: int = 2) -> Dict[str, Any]:
     rule = "반드시 유효한 JSON만 출력. 다른 텍스트/설명/마크다운/코드펜스 금지."
     last = None
     for _ in range(retries + 1):
         try:
-            txt = call_gemini_text(rule + "\n" + prompt, temperature=0.4)
+            txt = call_gemini_text(rule + "\n" + prompt, model=model, temperature=0.4)
             return _safe_json_loads(txt)
         except Exception as e:
             last = e
@@ -146,47 +152,70 @@ def format_weather_cards(f: Dict[str, Any]) -> List[Dict[str, Any]]:
     return cards
 
 
-# ========= Moodboard (Nano Banana) =========
+# ========= Moodboard prompts =========
 @st.cache_data(show_spinner=False)
-def moodboard_prompts(city: str, season: str, style: str, vibe: str) -> List[str]:
-    # 프롬프트를 다양하게 잡아 "비슷비슷한 사진" 덜 나오게
+def build_mood_prompts(city: str, season: str, style: str, vibe: str) -> List[str]:
+    # 4컷을 각기 다른 shot으로
     return [
         f"Photorealistic street-style fashion photo in {city} during {season}. Style: {style}. Vibe: {vibe}. Full body, natural light, no text, high detail.",
-        f"Photorealistic outfit flat-lay on a warm neutral background. Destination: {city}, season: {season}. Style: {style}. Include 7-9 items, no text, high detail.",
+        f"Photorealistic outfit flat-lay on warm neutral background. Destination: {city}, season: {season}. Style: {style}. Include 7-9 items, no text, high detail.",
         f"Photorealistic candid travel moment in {city} during {season}. Style: {style}. Vibe: {vibe}. Lifestyle, cinematic light, no text.",
         f"Photorealistic fashion editorial inspired by {city}. Season: {season}. Style: {style}. Vibe: {vibe}. Clean composition, premium look, no text.",
     ]
 
 
-def generate_moodboard_images(prompts: List[str]) -> List[Image.Image]:
+def generate_moodboard_images(prompts: List[str], image_model: str) -> List[Image.Image]:
+    """
+    IMPORTANT:
+    - 공식 문서 예시처럼 config(response_modalities) 없이 호출 (ClientError 회피용). :contentReference[oaicite:3]{index=3}
+    """
     client = gemini_client()
     imgs: List[Image.Image] = []
 
     for p in prompts:
         resp = client.models.generate_content(
-            model=IMAGE_MODEL,
+            model=image_model,
             contents=[p],
-            config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"]),
         )
 
-        parts = []
-        if hasattr(resp, "parts") and resp.parts:
-            parts = resp.parts
-        elif hasattr(resp, "candidates") and resp.candidates:
+        # 공식 문서 예시: response.parts에서 text/inline_data를 분기 :contentReference[oaicite:4]{index=4}
+        parts = getattr(resp, "parts", None)
+        if not parts and hasattr(resp, "candidates") and resp.candidates:
             parts = resp.candidates[0].content.parts
 
         got = False
-        for part in parts:
+        for part in parts or []:
             if getattr(part, "inline_data", None) is not None:
                 imgs.append(part.as_image())
                 got = True
                 break
 
         if not got:
-            # 한 장 실패해도 나머지는 진행
             continue
 
     return imgs
+
+
+def generate_text_moodboard(city: str, season: str, style: str, vibe: str, text_model: str) -> Dict[str, Any]:
+    prompt = f"""
+너는 크리에이티브 디렉터야. {city} / {season} / {style} / {vibe}로 무드보드를 텍스트로 구성해줘.
+
+반드시 JSON만 출력.
+
+스키마:
+{{
+  "headline": "한 줄 컨셉",
+  "keywords": ["키워드 8~12개"],
+  "color_palette": ["#RRGGBB", "#RRGGBB", "#RRGGBB", "#RRGGBB", "#RRGGBB"],
+  "shot_list": [
+    "샷 아이디어 1(짧게)",
+    "샷 아이디어 2",
+    "샷 아이디어 3",
+    "샷 아이디어 4"
+  ]
+}}
+"""
+    return call_gemini_json(prompt, model=text_model)
 
 
 # ========= UI =========
@@ -195,8 +224,8 @@ st.set_page_config(page_title="Tripfit", layout="wide")
 st.markdown(
     """
 <style>
-.block-container { padding-top: 1.0rem; }
-.big-title { font-size: 2.1rem; font-weight: 900; letter-spacing: -0.02em; }
+.block-container { padding-top: 0.9rem; }
+.big-title { font-size: 2.15rem; font-weight: 900; letter-spacing: -0.02em; }
 .subtle { color: rgba(0,0,0,0.55); }
 
 .card {
@@ -207,52 +236,35 @@ st.markdown(
   box-shadow: 0 8px 30px rgba(0,0,0,0.05);
 }
 
-.pill {
-  display: inline-block;
-  padding: 6px 10px;
-  border-radius: 999px;
-  background: rgba(0,0,0,0.06);
-  margin-right: 6px;
-  margin-bottom: 6px;
-  font-size: 0.85rem;
-}
-
 .hr { height: 1px; background: rgba(0,0,0,0.08); margin: 12px 0; }
 
 .mood-wrap {
-  background: linear-gradient(135deg, rgba(255,255,255,0.78), rgba(255,255,255,0.55));
+  background: linear-gradient(135deg, rgba(255,255,255,0.82), rgba(255,255,255,0.58));
   border: 1px solid rgba(0,0,0,0.06);
-  border-radius: 24px;
+  border-radius: 26px;
   padding: 18px;
-  box-shadow: 0 10px 40px rgba(0,0,0,0.06);
+  box-shadow: 0 12px 44px rgba(0,0,0,0.07);
 }
 
-.mood-title { font-size: 1.25rem; font-weight: 800; margin-bottom: 4px; }
+.mood-title { font-size: 1.35rem; font-weight: 900; margin-bottom: 2px; }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
 st.markdown('<div class="big-title">Tripfit ✈️👗</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtle">destination mood → outfit ideas → moodboard</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtle">moodboard first · then outfit ideas</div>', unsafe_allow_html=True)
 
-# state
-st.session_state.setdefault("outfits", [])
 st.session_state.setdefault("weather_cards", [])
 st.session_state.setdefault("weather_place", "")
 st.session_state.setdefault("mood_imgs", [])
-st.session_state.setdefault("mood_seed", 0)  # 버튼 클릭마다 값 증가시켜 rerun 안정화
+st.session_state.setdefault("mood_text_board", None)
+st.session_state.setdefault("outfits", [])
 
-# Sidebar (minimal)
+# Sidebar
 with st.sidebar:
     st.markdown("### 🔑 Gemini Key")
-    st.text_input(
-        "API Key",
-        type="password",
-        key="api_key_input",
-        placeholder="paste here",
-        help="세션에만 저장돼요(새로고침하면 사라짐).",
-    )
+    st.text_input("API Key", type="password", key="api_key_input", placeholder="paste here")
     st.caption("✅ ready" if get_api_key() else "키가 필요해요")
 
     st.markdown("---")
@@ -267,13 +279,17 @@ with st.sidebar:
     vibe = st.text_input("Vibe", value="clean, chic, city walk, travel street style")
     season_hint = st.text_input("Season (optional)", value="")
 
-# ========= Top: Moodboard (Hero) =========
+    st.markdown("---")
+    text_model = st.text_input("Text model", value=DEFAULT_TEXT_MODEL)
+    image_model = st.selectbox("Image model", IMAGE_MODEL_OPTIONS, index=0)
+
+# ========= HERO: Moodboard =========
 st.markdown('<div class="mood-wrap">', unsafe_allow_html=True)
-colA, colB = st.columns([1.3, 1])
+colA, colB = st.columns([1.4, 1])
+
 with colA:
     st.markdown('<div class="mood-title">🍌 Moodboard</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtle">핵심 기능 · 4컷으로 분위기를 먼저 잡자</div>', unsafe_allow_html=True)
-
+    st.markdown('<div class="subtle">핵심 기능 · 4컷을 크게</div>', unsafe_allow_html=True)
     season_for_image = st.text_input(
         "Season for images",
         value=season_hint.strip() if season_hint.strip() else "current season",
@@ -284,22 +300,49 @@ with colB:
     st.write("")
     st.write("")
     gen_mb = st.button("Generate Moodboard", type="primary", use_container_width=True)
+    st.caption("안되면 아래에 텍스트 무드보드로 자동 폴백")
 
 if gen_mb:
     if not get_api_key():
         st.error("Gemini API Key를 먼저 입력해줘.")
     else:
-        st.session_state.mood_seed += 1  # rerun 안정화(키 충돌 방지 목적)
-        prompts = moodboard_prompts(destination, season_for_image, style, vibe)
-        with st.spinner("creating…"):
-            imgs = generate_moodboard_images(prompts)
-        st.session_state.mood_imgs = imgs
+        prompts = build_mood_prompts(destination, season_for_image, style, vibe)
 
-# Moodboard gallery (big)
+        try:
+            with st.spinner("creating images…"):
+                imgs = generate_moodboard_images(prompts, image_model=image_model)
+            if not imgs:
+                raise RuntimeError("이미지 결과가 비어있어요.")
+            st.session_state.mood_imgs = imgs
+            st.session_state.mood_text_board = None
+
+        except genai_errors.ClientError:
+            # Streamlit Cloud에서는 원문이 redacted되므로, 사용자가 할 수 있는 체크만 안내
+            st.warning(
+                "이미지 생성 호출이 거절됐어요(ClientError). 아래 텍스트 무드보드를 대신 만들었어.\n\n"
+                "체크 포인트:\n"
+                "- AI Studio에서 발급한 **Gemini API Key**가 맞는지\n"
+                "- 해당 키/프로젝트에서 **Image Generation 모델 사용 권한/결제(필요 시)**이 켜져 있는지\n"
+                "- Image model을 바꿔서 재시도(사이드바에서 선택)"
+            )
+            st.session_state.mood_imgs = []
+            with st.spinner("creating text moodboard…"):
+                st.session_state.mood_text_board = generate_text_moodboard(
+                    destination, season_for_image, style, vibe, text_model=text_model
+                )
+
+        except Exception as e:
+            st.warning(f"이미지 생성이 실패했어요: {e}\n텍스트 무드보드로 전환합니다.")
+            st.session_state.mood_imgs = []
+            with st.spinner("creating text moodboard…"):
+                st.session_state.mood_text_board = generate_text_moodboard(
+                    destination, season_for_image, style, vibe, text_model=text_model
+                )
+
+# Render moodboard (big)
 imgs = st.session_state.mood_imgs
 if imgs:
     g1, g2 = st.columns(2)
-    # 2x2 크게
     if len(imgs) >= 1:
         g1.image(imgs[0], use_container_width=True)
     if len(imgs) >= 2:
@@ -308,13 +351,29 @@ if imgs:
         g1.image(imgs[2], use_container_width=True)
     if len(imgs) >= 4:
         g2.image(imgs[3], use_container_width=True)
+
 else:
-    st.markdown('<div class="subtle">아직 이미지가 없어요. 버튼을 눌러 4컷 무드를 만들어봐.</div>', unsafe_allow_html=True)
+    board = st.session_state.mood_text_board
+    if board:
+        st.markdown(f"### {board.get('headline','')}")
+        cols = st.columns([1.2, 1])
+        with cols[0]:
+            st.markdown("**Keywords**")
+            st.write(" · ".join(board.get("keywords", [])))
+            st.markdown("**Shot list**")
+            for s in board.get("shot_list", []):
+                st.write(f"- {s}")
+        with cols[1]:
+            st.markdown("**Palette**")
+            for c in board.get("color_palette", []):
+                st.color_picker(c, value=c, disabled=True, key=f"pal_{c}")
+    else:
+        st.markdown('<div class="subtle">아직 무드보드가 없어요. 버튼을 눌러 만들어봐.</div>', unsafe_allow_html=True)
 
 st.markdown("</div>", unsafe_allow_html=True)
 st.write("")
 
-# ========= Lower: Weather + Outfit =========
+# ========= Weather + Outfit ideas =========
 left, right = st.columns([1, 1.2])
 
 with left:
@@ -342,21 +401,21 @@ with left:
             )
             st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
     else:
-        st.markdown("<span class='subtle'>Update weather를 누르면 여행 기간 예보가 카드로 보여.</span>", unsafe_allow_html=True)
+        st.markdown("<span class='subtle'>Update weather를 누르면 기간 예보가 카드로 보여.</span>", unsafe_allow_html=True)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
 with right:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### 👗 Outfit ideas")
-    st.markdown("<span class='subtle'>무드보드 느낌을 유지하면서, 날씨를 반영한 룩 3개.</span>", unsafe_allow_html=True)
+    st.markdown("<span class='subtle'>무드보드 톤을 유지하면서 날씨 기반으로 3개.</span>", unsafe_allow_html=True)
     obtn = st.button("Generate outfits", type="primary", use_container_width=True)
 
     if obtn:
         if not get_api_key():
             st.error("Gemini API Key를 먼저 입력해줘.")
         else:
-            # 날씨 카드가 없으면 자동 업데이트
+            # 날씨 없으면 자동 업데이트
             if not st.session_state.weather_cards:
                 geo = geocode_city(destination)
                 if geo:
@@ -387,7 +446,6 @@ with right:
   "outfits": [
     {{
       "title": "룩 이름(감성적으로)",
-      "mood_tags": ["tag","tag"],
       "scenario": "언제 입는지(짧게)",
       "fit_and_color": "핏/컬러 한 줄",
       "items": ["아이템1", "아이템2", "아이템3", "아이템4", "아이템5"],
@@ -401,21 +459,18 @@ with right:
 - items는 실제 의류 품목으로.
 - 날씨가 비/바람/추움이면 대응 아이템 포함.
 """
-            data = call_gemini_json(prompt)
+            data = call_gemini_json(prompt, model=text_model)
             st.session_state.outfits = data.get("outfits", []) or []
 
     if st.session_state.outfits:
         for o in st.session_state.outfits:
             st.markdown(f"#### {o.get('title','')}")
-            tags = o.get("mood_tags", []) or []
-            if tags:
-                st.markdown("".join([f"<span class='pill'>{t}</span>" for t in tags]), unsafe_allow_html=True)
             st.markdown(f"**{o.get('scenario','')}**")
             st.caption(o.get("fit_and_color", ""))
 
             items = o.get("items", []) or []
             if items:
-                st.markdown("".join([f"<span class='pill'>{it}</span>" for it in items]), unsafe_allow_html=True)
+                st.write(" · ".join(items))
 
             st.caption(o.get("layering_tip", ""))
             st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
