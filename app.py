@@ -132,8 +132,8 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### 🎛️ 모델")
-    text_model = st.text_input("텍스트 추천 모델", value="gpt-5")
-    image_model = st.text_input("이미지 생성 모델", value="gpt-image-1.5")
+    text_model = st.text_input("텍스트 추천 모델", value="gpt-5.2")
+image_model = st.text_input("이미지 생성 모델", value="gpt-image-1")
     st.caption("이미지/비전 + 생성은 OpenAI Images/Responses로 연결돼요. :contentReference[oaicite:0]{index=0}")
 
 
